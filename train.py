@@ -11,7 +11,9 @@ import warnings
 warnings.filterwarnings('ignore')
 import time
 from collections import defaultdict
-
+import random
+from utils import load_audio_segment
+from config import SHORTLIST_DIR, PROCESSED_DIR, CHECKPOINT_DIR
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -53,13 +55,9 @@ class AudioVideoDataset(Dataset):
         json_data = self.load_json_data(video_id, clip_id)
 
         # ── Load and split audio ──────────────────────────────────────────
-        waveform, sr = torchaudio.load(audio_path)
+        waveform, sr = load_audio_segment(audio_path, start_sec, self.clip_duration * 2)
         if sr != self.sample_rate:
-            waveform = torchaudio.transforms.Resample(sr, self.sample_rate)(waveform)
-
-        start_frame = int(start_sec * self.sample_rate)
-        end_frame   = start_frame + int(self.clip_duration * 2 * self.sample_rate)
-        waveform    = waveform[:, start_frame:end_frame]
+            waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
 
         if waveform.shape[0] == 1:
             waveform = waveform.repeat(2, 1)
@@ -154,8 +152,8 @@ class AudioVideoDataset(Dataset):
         vm = json_data.get(motion_key, {})
         if not vm:
             return {
-                'rotation_direction':    n_classes // 4,  # neutral
-                'translation_direction': n_classes // 4,  # neutral
+                'rotation_direction':    -100,  # neutral
+                'translation_direction': -100,  # neutral
                 'rotation_class':        0,
                 'translation_class':     0,
             }
@@ -166,7 +164,7 @@ class AudioVideoDataset(Dataset):
         object_net_flow = vm.get('object_net_flow', 0.0) or 0.0
         inlier_ratio    = vm.get('inlier_ratio', 0.0)    or 0.0
 
-        MOTION_THRESHOLD = 2.0  # pixels
+        MOTION_THRESHOLD = 1.0  # pixels
 
         has_camera = (camera_side is not None and
                       abs(camera_net_flow) > MOTION_THRESHOLD)
@@ -194,7 +192,8 @@ class AudioVideoDataset(Dataset):
         elif dominant_side == 'left':
             base_class = 0
         else:
-            base_class = n_classes // 4  # neutral — quarter point
+            return {'rotation_direction': -100, 'translation_direction': -100,
+                    'rotation_class': 0, 'translation_class': 0}
 
         # Use flow magnitude to spread within the half
         # Stronger flow → higher bin within the half
@@ -329,7 +328,7 @@ class SpatialSoundLocalizationModel(nn.Module):
 # ---------------------------------------------------------------------------
 
 def combined_loss(outputs, targets, lambda1=0.9, lambda2=1.0):
-    ce      = nn.CrossEntropyLoss()
+    ce = nn.CrossEntropyLoss(ignore_index=-100)
     L_rot   = ce(outputs['relative_rotation'],    targets['rotation_direction'])
     L_trans = ce(outputs['relative_translation'],  targets['translation_direction'])
     L_side  = ce(outputs['dominant_side'],         targets['dominant_side'])
@@ -412,9 +411,10 @@ def _run_epoch(models_dict, loaders_dict, optimizers_dict, device,
                 stats[name]['losses'][k] += loss_dict[k]
 
             _, pred = torch.max(outputs['relative_rotation'], 1)
-            stats[name]['total']    += targets['rotation_direction'].size(0)
-            stats[name]['correct']  += (pred == targets['rotation_direction']).sum().item()
-            stats[name]['n_batches'] += 1
+            tgt   = targets['rotation_direction']
+            valid = tgt != -100
+            stats[name]['total']   += valid.sum().item()
+            stats[name]['correct'] += (pred[valid] == tgt[valid]).sum().item()
 
         # ── Average losses over this model's own batches ──────────────────
         n = max(stats[name]['n_batches'], 1)
@@ -430,27 +430,12 @@ def _run_epoch(models_dict, loaders_dict, optimizers_dict, device,
 # Video-level train/val split
 # ---------------------------------------------------------------------------
 
-def split_by_video(dataset, val_ratio=0.2, seed=42):
-    """
-    Split dataset into train/val ensuring no video appears in both splits.
-    Prevents data leakage from clips of the same video being in both sets.
-    """
-    from collections import defaultdict
-    import random
-
-    rng = random.Random(seed)
-
-    # Group indices by video_id
+def split_by_video(dataset, val_videos):
     video_to_indices = defaultdict(list)
     for i, entry in enumerate(dataset.manifest):
         video_to_indices[entry['video_id']].append(i)
-
-    video_ids = list(video_to_indices.keys())
-    rng.shuffle(video_ids)
-
-    n_val_videos = max(1, int(len(video_ids) * val_ratio))
-    val_videos   = set(video_ids[:n_val_videos])
-    train_videos = set(video_ids[n_val_videos:])
+    train_videos = set(video_to_indices) - val_videos
+    val_videos   = set(video_to_indices) & val_videos
 
     train_indices = [i for vid in train_videos for i in video_to_indices[vid]]
     val_indices   = [i for vid in val_videos   for i in video_to_indices[vid]]
@@ -575,23 +560,18 @@ if __name__ == "__main__":
 
     lambda1, lambda2 = 0.9, 1.0
 
-    MANIFEST_PATH       = Path("/fs/nexus-scratch/vyomwal5/vgg/shortlisted/index.json")
-    MANIFEST_LOFTR_PATH = Path("/fs/nexus-scratch/vyomwal5/vgg/shortlisted/index_loftr.json")
-    PROCESSED_DIR       = Path("/fs/nexus-scratch/vyomwal5/vgg/processed")
-    SAVE_DIR            = Path("/fs/nexus-scratch/vyomwal5/vgg/checkpoints")
+    MANIFEST_PATH       = SHORTLIST_DIR / "index.json"
+    MANIFEST_LOFTR_PATH = SHORTLIST_DIR / "index_loftr.json"
+    SAVE_DIR            = CHECKPOINT_DIR
     LOAD_PRETRAINED     = None  # set to SAVE_DIR to resume
 
     # ── Datasets with video-level splits ─────────────────────────────────
-    print("Loading SuperGlue dataset...")
-    full_dataset_sp = AudioVideoDataset(MANIFEST_PATH, PROCESSED_DIR)
-    print(f"  Total clips: {len(full_dataset_sp)}")
-    train_dataset_sp, val_dataset_sp = split_by_video(full_dataset_sp, val_ratio=0.2)
-
-    print("Loading LoFTR dataset...")
-    full_dataset_loftr = AudioVideoDataset(MANIFEST_LOFTR_PATH, PROCESSED_DIR)
-    print(f"  Total clips: {len(full_dataset_loftr)}")
-    train_dataset_loftr, val_dataset_loftr = split_by_video(
-        full_dataset_loftr, val_ratio=0.2)
+    all_vids = sorted({e['video_id'] for e in full_dataset_sp.manifest} |
+                  {e['video_id'] for e in full_dataset_loftr.manifest})
+    random.Random(42).shuffle(all_vids)
+    val_videos = set(all_vids[:max(1, int(0.2 * len(all_vids)))])
+    train_dataset_sp,    val_dataset_sp    = split_by_video(full_dataset_sp, val_videos)
+    train_dataset_loftr, val_dataset_loftr = split_by_video(full_dataset_loftr, val_videos)
 
     # ── Dataloaders ───────────────────────────────────────────────────────
     train_loader = DataLoader(

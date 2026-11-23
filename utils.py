@@ -6,8 +6,7 @@ import subprocess
 from pathlib import Path
 from kornia.feature import LoFTR as KorniaLoFTR
 import torch
-torchaudio.set_audio_backend("soundfile")
-
+import sys
 
 # ================= VIDEO =================
 
@@ -79,17 +78,20 @@ def generate_frame_pairs(frames_dir, pairs_file):
 def run_superglue(frames_dir, pairs_file, output_dir, superglue_script, force_cpu=False):
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        "python", superglue_script,
-        "--input_dir", str(frames_dir),
-        "--input_pairs", str(pairs_file),
-        "--output_dir", str(output_dir),
-        "--resize", "320", "240"
-    ]
+    cmd = [sys.executable, str(superglue_script),
+       "--input_dir", str(frames_dir), "--input_pairs", str(pairs_file),
+       "--output_dir", str(output_dir), "--resize", "320", "240",
+       "--superglue", "outdoor"]
+    if force_cpu:
+        cmd.append("--force_cpu")
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
 
-    subprocess.run(cmd, check=True)
-
-
+_LOFTR = {}
+def _get_loftr(weights, device):
+    key = (weights, str(device))
+    if key not in _LOFTR:
+        _LOFTR[key] = KorniaLoFTR(pretrained=weights).to(device).eval()
+    return _LOFTR[key]
 
 def run_loftr(frames_dir, pairs_file, output_dir, weights="outdoor",
               resize=(320, 240), confidence_threshold=0.5, force_cpu=False):
@@ -108,8 +110,7 @@ def run_loftr(frames_dir, pairs_file, output_dir, weights="outdoor",
 
     output_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cpu" if force_cpu or not torch.cuda.is_available() else "cuda")
-    print(f"Running LoFTR on device: {device}")
-    matcher = KorniaLoFTR(pretrained=weights).to(device).eval()
+    matcher = _get_loftr(weights, device)
 
     target_w, target_h = resize
 
@@ -152,9 +153,6 @@ def run_loftr(frames_dir, pairs_file, output_dir, weights="outdoor",
                 matcher=np.array("loftr"),
             )
 
-    del matcher
-    if torch.cuda.is_available() and not force_cpu:
-        torch.cuda.empty_cache()
 
 def analyze_motion_superglue(npz_dir):
     """
@@ -169,9 +167,7 @@ def analyze_motion_superglue(npz_dir):
         points flow RIGHT (mkpts1.x > mkpts0.x) → camera moved LEFT in world
         points flow LEFT  (mkpts1.x < mkpts0.x) → camera moved RIGHT in world
     """
-    all_mkpts0 = []
-    all_mkpts1 = []
-    all_conf   = []
+    per_pair = []
 
     for npz_path in npz_dir.glob("*matches.npz"):
         data    = np.load(npz_path)
@@ -191,18 +187,9 @@ def analyze_motion_superglue(npz_dir):
         if len(mkpts0) == 0:
             continue
 
-        all_mkpts0.append(mkpts0)
-        all_mkpts1.append(mkpts1)
-        all_conf.append(conf)
+        per_pair.append(_compute_motion_with_ransac(mkpts0, mkpts1, conf, matcher="superglue"))
 
-    if not all_mkpts0:
-        return None
-
-    mkpts0 = np.concatenate(all_mkpts0, axis=0)
-    mkpts1 = np.concatenate(all_mkpts1, axis=0)
-    conf   = np.concatenate(all_conf,   axis=0)
-
-    return _compute_motion_with_ransac(mkpts0, mkpts1, conf, matcher="superglue")
+    return _aggregate_pairs(per_pair, "superglue")
 
 
 def analyze_motion_loftr(npz_dir, confidence_threshold=0.5):
@@ -223,9 +210,7 @@ def analyze_motion_loftr(npz_dir, confidence_threshold=0.5):
         BUT for outliers (object motion):
         points flow RIGHT → object moved RIGHT in world  (same direction)
     """
-    all_mkpts0 = []
-    all_mkpts1 = []
-    all_conf   = []
+    per_pair = []
 
     for npz_path in npz_dir.glob("*loftr.npz"):
         data = np.load(npz_path, allow_pickle=True)
@@ -247,19 +232,31 @@ def analyze_motion_loftr(npz_dir, confidence_threshold=0.5):
         if len(mkpts0) == 0:
             continue
 
-        all_mkpts0.append(mkpts0)
-        all_mkpts1.append(mkpts1)
-        all_conf.append(conf)
+        per_pair.append(_compute_motion_with_ransac(mkpts0, mkpts1, conf, matcher="superglue"))
+    return _aggregate_pairs(per_pair, "loftr")
 
-    if not all_mkpts0:
+def _aggregate_pairs(per_pair, matcher):
+    per_pair = [r for r in per_pair if r is not None]
+    if not per_pair:
         return None
-
-    mkpts0 = np.concatenate(all_mkpts0, axis=0)
-    mkpts1 = np.concatenate(all_mkpts1, axis=0)
-    conf   = np.concatenate(all_conf,   axis=0)
-
-    return _compute_motion_with_ransac(mkpts0, mkpts1, conf, matcher="loftr")
-
+    tot = sum(r["total_matches"] for r in per_pair)
+    inl = sum(r["num_inliers"] for r in per_pair)
+    out = sum(r["num_outliers"] for r in per_pair)
+    def mean_flow(k):
+        v = [r[k] for r in per_pair if r[k] is not None]
+        return float(np.mean(v)) if v else None
+    cam, obj = mean_flow("camera_net_flow"), mean_flow("object_net_flow")
+    return {
+        "matcher": matcher, "num_pairs": len(per_pair),
+        "total_matches": tot, "num_inliers": inl, "num_outliers": out,
+        "inlier_ratio": inl / max(tot, 1),
+        "mean_confidence": float(np.average([r["mean_confidence"] for r in per_pair],
+                                            weights=[r["total_matches"] for r in per_pair])),
+        "camera_net_flow": cam,
+        "camera_world_side": None if cam is None else ("left" if cam > 0 else "right"),
+        "object_net_flow": obj,
+        "object_world_side": None if obj is None else ("right" if obj > 0 else "left"),
+    }
 
 def _compute_motion_with_ransac(mkpts0, mkpts1, conf, matcher):
     """

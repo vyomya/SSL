@@ -1,5 +1,5 @@
 """
-pipeline_combined.py
+pipeline.py
 
 Handles three cases for each clip of every video:
   1. OLD processed  — clip_dir exists, result.json has OLD format (no video_path/start_sec),
@@ -18,7 +18,7 @@ Handles three cases for each clip of every video:
 import json
 import subprocess
 from pathlib import Path
-
+import os
 from utils import (
     extract_frames_from_segment,
     generate_frame_pairs,
@@ -31,20 +31,14 @@ from utils import (
 
 # ================= CONFIG =================
 
-BASE_DIR = Path("/fs/nexus-scratch/vyomwal5/vgg/")
-VIDEO_DIR = BASE_DIR / "video"
-AUDIO_DIR = BASE_DIR / "audio"
-OUTPUT_DIR = BASE_DIR / "processed"
+from config import VIDEO_DIR, AUDIO_DIR, PROCESSED_DIR as OUTPUT_DIR, SHORTLIST_DIR, SUPERGLUE_SCRIPT
+RECOMPUTE_MOTION = False
 
-SUPERGLUE_SCRIPT = "/nfshomes/vyomwal5/SSL/SuperGluePretrainedNetwork/match_pairs.py"
 FRAME_INTERVAL_SEC = 1
 FORCE_CPU = False
-
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv"}
-
 CLIP_SEC = 5
 STRIDE = 2
-
 # ================= HELPERS =================
 
 def get_video_duration(video_path):
@@ -56,11 +50,16 @@ def get_video_duration(video_path):
     ]
     return float(subprocess.check_output(cmd).decode().strip())
 
+def write_json_atomic(path, obj):
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+    os.replace(tmp, path)
 
 def is_new_format(result: dict) -> bool:
-    """New-format result.json has video_path, audio_path, start_sec, end_sec."""
-    return all(k in result["visual_motion_loftr"] for k in ["camera_world_side", "camera_net_flow", "object_world_side", "object_net_flow"])
-
+    vm = result.get("visual_motion_loftr") if result else None
+    return isinstance(vm, dict) and all(k in vm for k in (
+        "camera_world_side", "camera_net_flow", "object_world_side", "object_net_flow"))
 
 def is_old_format(result: dict, clip_dir: Path) -> bool:
     """Old-format result.json lacks timing fields but has video.mp4 / audio.wav in the clip dir."""
@@ -221,6 +220,7 @@ def process_video(video_path: Path, audio_path: Path):
         result_path = clip_dir / "result.json"  # final result file for both cases (migrated or new)
 
         try:
+            motion = motion_loftr = audio_stats = None
             # ── Determine which case we're in ──────────────────────────────
             if result_path.exists():
                 with open(result_path) as f:
@@ -232,7 +232,11 @@ def process_video(video_path: Path, audio_path: Path):
                     motion = result["visual_motion"]
                     audio_stats = result["audio_spatial"]
                     motion_loftr = result.get("visual_motion_loftr")
-
+                    if RECOMPUTE_MOTION and (clip_dir / "matches").exists():
+                        motion = analyze_motion_superglue(clip_dir / "matches")
+                        motion_loftr = analyze_motion_loftr(clip_dir / "matches")
+                        result["visual_motion"], result["visual_motion_loftr"] = motion, motion_loftr
+                        write_json_atomic(result_path, result)
 
                 elif is_old_format(result, clip_dir):
                     # ── CASE 1: old format — migrate result.json ─────────────
@@ -240,11 +244,10 @@ def process_video(video_path: Path, audio_path: Path):
                     result = migrate_old_result(
                         result, clip_dir, video_path, audio_path, start, end
                     )
-                    with open(result_path, "w") as f:
-                        json.dump(result, f, indent=2)
+                    write_json_atomic(result_path, result)
                     motion = result["visual_motion"]
                     audio_stats = result["audio_spatial"]
-
+                    motion_loftr = result.get("visual_motion_loftr")
                 else:
                     # result.json exists but is neither clearly old nor new —
                     # treat as unprocessed and rerun
@@ -298,8 +301,7 @@ def process_video(video_path: Path, audio_path: Path):
                     "visual_motion": motion,
                     "audio_spatial": audio_stats,
                 }
-                with open(result_path, "w") as f:
-                    json.dump(result, f, indent=2)
+                write_json_atomic(result_path, result)
 
             # ── Shortlist rule (same for all cases) ───────────────────────
             if passes_shortlist_rule(motion, audio_stats):
@@ -333,31 +335,12 @@ def process_video(video_path: Path, audio_path: Path):
 
 
 def main():
-    shortlist_loftr_path = BASE_DIR / "shortlisted" / "index_loftr.json"
-    shortlist_index_path = BASE_DIR / "shortlisted" / "index.json"
+    shortlist_loftr_path = SHORTLIST_DIR / "index_loftr.json"
+    shortlist_index_path = SHORTLIST_DIR / "index.json"
     shortlist_index_path.parent.mkdir(parents=True, exist_ok=True)
     shortlist_loftr_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Load existing index so we don't lose entries from previous runs
-    if shortlist_index_path.exists():
-        with open(shortlist_index_path) as f:
-            existing_index = json.load(f)
-        # Key by (video_id, clip_id) for deduplication
-        existing_keys = {(e["video_id"], e["clip_id"]) for e in existing_index}
-        print(f"📋 Loaded existing index with {len(existing_index)} entries")
-    else:
-        existing_index = []
-        existing_keys = set()
-
-    if shortlist_loftr_path.exists():
-        with open(shortlist_loftr_path) as f:
-            existing_loftr_index = json.load(f)
-        # Key by (video_id, clip_id) for deduplication
-        existing_loftr_keys = {(e["video_id"], e["clip_id"]) for e in existing_loftr_index}
-        print(f"📋 Loaded existing LoFTR index with {len(existing_loftr_index)} entries")
-    else:
-        existing_loftr_index = []
-        existing_loftr_keys = set()
 
     shortlisted_loftr = []   # fresh list rebuilt for this run; merged with existing below
     shortlisted = []       # final shortlist for this run (after SuperGlue re-eval)
@@ -378,26 +361,11 @@ def main():
         shortlisted_loftr.extend(a)
         shortlisted.extend(b)
 
-    # # Merge: keep existing entries not touched this run, add/update this run's results
-    # new_keys = {(e["video_id"], e["clip_id"]) for e in shortlisted}
-    # merged = [e for e in existing_index if (e["video_id"], e["clip_id"]) not in new_keys]
-    # merged.extend(shortlisted)
+    write_json_atomic(shortlist_index_path, shortlisted)
+    write_json_atomic(shortlist_loftr_path, shortlisted_loftr)
 
-    with open(shortlist_index_path, "w") as f:
-        json.dump(shortlisted, f, indent=2)
-
-    # Merge: keep existing entries not touched this run, add/update this run's results
-    # new_keys_loftr = {(e["video_id"], e["clip_id"]) for e in shortlisted_loftr}
-    # merged_loftr = [e for e in existing_loftr_index if (e["video_id"], e["clip_id"]) not in new_keys_loftr]
-    # merged_loftr.extend(shortlisted_loftr)
-
-    with open(shortlist_loftr_path, "w") as f:
-        json.dump(shortlisted_loftr, f, indent=2)
-
-    print(f"\n✅ index_loftr.json saved → {shortlist_loftr_path}")
-    print(f"   Total entries: {len(shortlisted_loftr)}  "
-          f"(this run: {len(shortlisted_loftr)} | carried over: {len(shortlisted_loftr) - len(shortlisted_loftr)})")
-
+    print(f"✅ index.json       {len(shortlisted):>6} clips → {shortlist_index_path}")
+    print(f"✅ index_loftr.json {len(shortlisted_loftr):>6} clips → {shortlist_loftr_path}")
 
 if __name__ == "__main__":
     main()

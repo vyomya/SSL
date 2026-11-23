@@ -1,12 +1,14 @@
 import torch
+import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import VIDEO_DIR, AUDIO_DIR, PROCESSED_DIR, SHORTLIST_DIR, CHECKPOINT_DIR, VGGSOUND_CSV
 
 # Load the checkpoint
-checkpoint = torch.load("/fs/nexus-scratch/vyomwal5/vgg/checkpoints/best_sp_model.pth",map_location=torch.device('cpu'))  # Use map_location if loading on a different device
+checkpoint = torch.load(CHECKPOINT_DIR / "best_sp_model.pth", map_location=torch.device('cpu'))  # Use map_location if loading on a different device
 
 # Extract saved information
 epoch = checkpoint['epoch']
 motion_cue = checkpoint['motion_cue']
-motion_key = checkpoint['motion_key']
+motion_key = checkpoint.get('motion_key', checkpoint['motion_cue'])
 model_state_dict = checkpoint['model_state_dict']
 optimizer_state_dict = checkpoint['optimizer_state_dict']
 val_acc = checkpoint['val_acc']

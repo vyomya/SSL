@@ -2,7 +2,8 @@ import soundfile as sf
 from pathlib import Path
 from collections import Counter
 import sys
-
+from pathlib import Path; sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import VIDEO_DIR, AUDIO_DIR, PROCESSED_DIR, SHORTLIST_DIR, CHECKPOINT_DIR, VGGSOUND_CSV
 def check_stereo(audio_dir):
     audio_dir = Path(audio_dir)
     files = list(audio_dir.glob("*.wav")) + list(audio_dir.glob("*.mp3")) + \
@@ -58,5 +59,5 @@ def check_stereo(audio_dir):
         print(f"\n✅  Majority stereo — IID supervision is viable.")
 
 if __name__ == "__main__":
-    folder = sys.argv[1] if len(sys.argv) > 1 else "/fs/nexus-scratch/vyomwal5/vgg/audio"
+    folder = sys.argv[1] if len(sys.argv) > 1 else AUDIO_DIR
     check_stereo(folder)

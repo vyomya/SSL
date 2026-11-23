@@ -1,7 +1,8 @@
 import argparse
 import os
 import sys
-
+from pathlib import Path; sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import VIDEO_DIR, AUDIO_DIR, PROCESSED_DIR, SHORTLIST_DIR, CHECKPOINT_DIR, VGGSOUND_CSV
 
 def gather_files(path):
     if not os.path.isdir(path):

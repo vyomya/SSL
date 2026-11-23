@@ -3,6 +3,8 @@ from pathlib import Path
 import numpy as np
 from random import sample
 import json
+import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import VIDEO_DIR, AUDIO_DIR, PROCESSED_DIR, SHORTLIST_DIR, CHECKPOINT_DIR, VGGSOUND_CSV
 
 def verify_stereo_quality(audio_dir, manifest_path, n_samples=50):
     """
@@ -98,7 +100,7 @@ def verify_stereo_quality(audio_dir, manifest_path, n_samples=50):
               f"{(iid_values > 0.1).sum()} ({100*(iid_values>0.1).mean():.1f}%)")
 
 verify_stereo_quality(
-    audio_dir     = "/fs/nexus-scratch/vyomwal5/vgg/audio",
-    manifest_path = "/fs/nexus-scratch/vyomwal5/vgg/shortlisted/index.json",
+    audio_dir     = AUDIO_DIR,
+    manifest_path = SHORTLIST_DIR / "index.json",
     n_samples     = 50
 )

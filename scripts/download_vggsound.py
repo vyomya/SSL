@@ -1,10 +1,8 @@
 import csv
 import subprocess
 import os
-
-BASE_DIR = "audioset_data"
-VIDEO_DIR = os.path.join(BASE_DIR, "video")
-AUDIO_DIR = os.path.join(BASE_DIR, "audio")
+import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import VIDEO_DIR, AUDIO_DIR, PROCESSED_DIR, SHORTLIST_DIR, CHECKPOINT_DIR, VGGSOUND_CSV
 
 os.makedirs(VIDEO_DIR, exist_ok=True)
 os.makedirs(AUDIO_DIR, exist_ok=True)

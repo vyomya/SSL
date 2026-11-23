@@ -1,6 +1,8 @@
 from collections import Counter
 import json
 from pathlib import Path
+import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import VIDEO_DIR, AUDIO_DIR, PROCESSED_DIR, SHORTLIST_DIR, CHECKPOINT_DIR, VGGSOUND_CSV
 
 def check_label_distribution(manifest_path, processed_dir):
     with open(manifest_path) as f:
@@ -87,6 +89,6 @@ def check_label_distribution(manifest_path, processed_dir):
         print(f"  {side:>10}: {count:>6} ({100*count/valid:.1f}%)")
 
 check_label_distribution(
-    "/fs/nexus-scratch/vyomwal5/vgg/shortlisted/index_loftr.json",
-    "/fs/nexus-scratch/vyomwal5/vgg/processed"
+    SHORTLIST_DIR / "index_loftr.json",
+    PROCESSED_DIR
 )

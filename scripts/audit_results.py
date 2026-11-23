@@ -1,6 +1,8 @@
 from pathlib import Path
 import json 
 import os
+import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import VIDEO_DIR, AUDIO_DIR, PROCESSED_DIR, SHORTLIST_DIR, CHECKPOINT_DIR, VGGSOUND_CSV
 
 def safe_load_json(path):
     """
@@ -46,7 +48,7 @@ videos = sorted(
 )
 
 for i, video_path in enumerate(videos):
-    result_path = Path("/fs/nexus-scratch/vyomwal5/vgg/processed/") / video_path.stem
+    result_path = PROCESSED_DIR / video_path.stem
 
     if not result_path.exists():
         continue
