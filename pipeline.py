@@ -25,7 +25,7 @@ from utils import (
     run_superglue,
     run_loftr,
     analyze_motion_loftr,
-    analyze_motion,
+    analyze_motion_superglue,
     compute_audio_stats_segment,
 )
 
@@ -59,7 +59,7 @@ def get_video_duration(video_path):
 
 def is_new_format(result: dict) -> bool:
     """New-format result.json has video_path, audio_path, start_sec, end_sec."""
-    return all(k in result for k in ("video_path", "audio_path", "start_sec", "end_sec"))
+    return all(k in result["visual_motion_loftr"] for k in ["camera_world_side", "camera_net_flow", "object_world_side", "object_net_flow"])
 
 
 def is_old_format(result: dict, clip_dir: Path) -> bool:
@@ -70,12 +70,116 @@ def is_old_format(result: dict, clip_dir: Path) -> bool:
         (clip_dir / "audio.wav").exists()
     )
 
-
 def passes_shortlist_rule(motion: dict, audio_stats: dict) -> bool:
-    return (
-        motion["left"] > motion["right"] and
-        audio_stats["dominant_side"] != "left"
+    """
+    Filter samples for training using corrected world-space motion labels.
+    
+    motion dict expected keys (from _compute_motion_with_ransac):
+        camera_world_side : "left" | "right" | None
+        camera_net_flow   : float | None   (raw point flow, + = points flowed right)
+        object_world_side : "left" | "right" | None
+        object_net_flow   : float | None
+        inlier_ratio      : float
+        num_inliers       : int
+        num_outliers      : int
+        mean_confidence   : float
+        total_matches     : int
+
+    audio_stats dict expected keys (from compute_audio_stats_segment):
+        dominant_side     : "left" | "right" | "ambiguous"
+        abs_mean_iid_db   : float
+        iid_consistency   : float
+    """
+
+    if motion is None or audio_stats is None:
+        return False
+
+    # ── 1. Audio quality gates — check first, cheapest rejection ──────────
+
+    if audio_stats.get("dominant_side") == "ambiguous":
+        return False
+
+    # IID must be a real signal, not floating point noise
+    # if audio_stats.get("abs_mean_iid_db", 0.0) < :  # e.g. 1.0 dB
+    #     return False
+
+    # IID must be consistent across time windows
+    if audio_stats.get("iid_consistency", 0.0) < 0.6:
+        return False
+
+    audio_side = audio_stats["dominant_side"]
+
+    # ── 2. Match quality gates ─────────────────────────────────────────────
+
+    if motion.get("mean_confidence", 0.0) < 0.5:
+        return False
+
+    if motion.get("total_matches", 0) < 50:
+        return False
+
+    # ── 3. Determine what is moving ────────────────────────────────────────
+
+    camera_net_flow = motion.get("camera_net_flow")
+    object_net_flow = motion.get("object_net_flow")
+    camera_side     = motion.get("camera_world_side")
+    object_side     = motion.get("object_world_side")
+    inlier_ratio    = motion.get("inlier_ratio", 0.0)
+    num_inliers     = motion.get("num_inliers", 0)
+    num_outliers    = motion.get("num_outliers", 0)
+
+    has_camera = (
+        camera_side is not None and
+        camera_net_flow is not None and
+        abs(camera_net_flow) > 1.0        # e.g. 2.0 pixels
     )
+
+    has_object = (
+        object_side is not None and
+        object_net_flow is not None and 
+        abs(object_net_flow) > 1.0
+    )
+
+    # Nothing moved significantly
+    if not has_camera and not has_object:
+        return False
+
+    # ── 4. Case-based direction agreement ─────────────────────────────────
+
+    # Case 1: Camera motion only
+    if has_camera and not has_object:
+        if inlier_ratio < 0.5 or num_inliers < 50:
+            return False
+        return camera_side == audio_side
+
+    # Case 2: Object motion only (static camera)
+    if has_object and not has_camera:
+        if num_outliers < 30:
+            return False
+        return object_side == audio_side
+
+    # Case 3: Both moving
+    if has_camera and has_object:
+
+        # 3a: All three agree — strongest signal
+        if camera_side == object_side == audio_side:
+            return True
+
+        # 3b: Camera agrees, object disagrees — trust camera if background dominates
+        if camera_side == audio_side and object_side != audio_side:
+            return inlier_ratio > 0.75
+
+        # 3c: Object agrees, camera disagrees — trust object if it's strong enough
+        if object_side == audio_side and camera_side != audio_side:
+            foreground_ratio = num_outliers / max(num_inliers + num_outliers, 1)
+            object_stronger  = abs(object_net_flow) > abs(camera_net_flow)
+            return foreground_ratio > 0.3 and object_stronger
+
+        # 3d: Neither agrees with audio
+        return False
+
+    return False
+
+    
 
 
 def migrate_old_result(result: dict, clip_dir: Path, video_path: Path, audio_path: Path,
@@ -178,7 +282,7 @@ def process_video(video_path: Path, audio_path: Path):
                     SUPERGLUE_SCRIPT, FORCE_CPU
                 )
 
-                motion = analyze_motion(matches_dir)
+                motion = analyze_motion_superglue(matches_dir)
 
                 audio_stats = compute_audio_stats_segment(
                     audio_path, start_sec=start, duration_sec=CLIP_SEC
@@ -258,8 +362,8 @@ def main():
     shortlisted_loftr = []   # fresh list rebuilt for this run; merged with existing below
     shortlisted = []       # final shortlist for this run (after SuperGlue re-eval)
 
-    videos = sorted([v for v in VIDEO_DIR.iterdir() if v.suffix in VIDEO_EXTS],reverse=True)
-
+    videos = sorted([v for v in VIDEO_DIR.iterdir() if v.suffix in VIDEO_EXTS])
+    # videos = videos[3500:5500]  # TEMP LIMIT for testing
     for i,video_path in enumerate(videos):
         print(f"\nProcessing video {i+1}/{len(videos)}: {video_path.name}")
         stem = video_path.stem
@@ -274,25 +378,25 @@ def main():
         shortlisted_loftr.extend(a)
         shortlisted.extend(b)
 
-    # Merge: keep existing entries not touched this run, add/update this run's results
-    new_keys = {(e["video_id"], e["clip_id"]) for e in shortlisted}
-    merged = [e for e in existing_index if (e["video_id"], e["clip_id"]) not in new_keys]
-    merged.extend(shortlisted)
+    # # Merge: keep existing entries not touched this run, add/update this run's results
+    # new_keys = {(e["video_id"], e["clip_id"]) for e in shortlisted}
+    # merged = [e for e in existing_index if (e["video_id"], e["clip_id"]) not in new_keys]
+    # merged.extend(shortlisted)
 
     with open(shortlist_index_path, "w") as f:
-        json.dump(merged, f, indent=2)
+        json.dump(shortlisted, f, indent=2)
 
     # Merge: keep existing entries not touched this run, add/update this run's results
-    new_keys_loftr = {(e["video_id"], e["clip_id"]) for e in shortlisted_loftr}
-    merged_loftr = [e for e in existing_loftr_index if (e["video_id"], e["clip_id"]) not in new_keys_loftr]
-    merged_loftr.extend(shortlisted_loftr)
+    # new_keys_loftr = {(e["video_id"], e["clip_id"]) for e in shortlisted_loftr}
+    # merged_loftr = [e for e in existing_loftr_index if (e["video_id"], e["clip_id"]) not in new_keys_loftr]
+    # merged_loftr.extend(shortlisted_loftr)
 
     with open(shortlist_loftr_path, "w") as f:
-        json.dump(merged_loftr, f, indent=2)
+        json.dump(shortlisted_loftr, f, indent=2)
 
     print(f"\n✅ index_loftr.json saved → {shortlist_loftr_path}")
-    print(f"   Total entries: {len(merged_loftr)}  "
-          f"(this run: {len(shortlisted_loftr)} | carried over: {len(merged_loftr) - len(shortlisted_loftr)})")
+    print(f"   Total entries: {len(shortlisted_loftr)}  "
+          f"(this run: {len(shortlisted_loftr)} | carried over: {len(shortlisted_loftr) - len(shortlisted_loftr)})")
 
 
 if __name__ == "__main__":
